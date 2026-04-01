@@ -4,7 +4,7 @@ Quasi Monte Carlo simulation of an Asian (barrier) option  under BS (GBM) using 
 Run:
 python asian_(barrier)_option_pricer.py
 
-#Data
+# Data
 Parameters can be adjusted within the code. 
 
 
