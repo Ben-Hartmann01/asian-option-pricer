@@ -3,7 +3,7 @@ Asian barrier option pricing engine under Black-Scholes / Brownian motion.
 Supports:
 - standard Monte Carlo
 - Sobol quasi-Monte Carlo
-- Sobol random quasi-Monta Carlo
+- Sobol random quasi-Monte Carlo
 - PCA construction for Brownian paths
 """
 
