@@ -1,5 +1,10 @@
 """
-Asian barrier option pricing engine under Black-Scholes / Brownian
+Asian option pricing engine under Black-Scholes / Brownian motion.
+Supports:
+- standard Monte Carlo
+- Sobol quasi-Monte Carlo
+- Sobol random quasi-Monta Carlo
+- PCA construction for Brownian paths
 """
 
 from __future__ import annotations
@@ -14,7 +19,6 @@ from scipy.stats import norm, qmc
 
 OptionType = Literal["call", "put"]
 AverageType = Literal["arithmetic", "geometric"]
-BarrierType = Literal["up-and-out", "down-and-out", "up-and-in", "down-and-in"]
 
 
 @dataclass
@@ -26,13 +30,11 @@ class MarketParams:
 
 
 @dataclass
-class AsianBarrierOptionSpec:
+class AsianOptionSpec:
     strike: float = 100.0
-    barrier: float = 120.0
     n_fixings: int = 52
     option_type: OptionType = "call"
     average_type: AverageType = "arithmetic"
-    barrier_type: BarrierType = "up-and-out"
 
 
 def black_scholes_european_price(
@@ -49,6 +51,7 @@ def black_scholes_european_price(
     vol_sqrt_t = sigma * sqrt(t)
     d1 = (log(s0 / k) + (r + 0.5 * sigma**2) * t) / vol_sqrt_t
     d2 = d1 - vol_sqrt_t
+
     if option_type == "call":
         return s0 * norm.cdf(d1) - k * exp(-r * t) * norm.cdf(d2)
     return k * exp(-r * t) * norm.cdf(-d2) - s0 * norm.cdf(-d1)
@@ -133,14 +136,11 @@ def simulate_gbm_paths_from_normals(
     return np.exp(log_s)
 
 
-def asian_barrier_payoff(
+def asian_payoff(
     paths: np.ndarray,
     strike: float,
-    barrier: float,
     option_type: OptionType = "call",
     average_type: AverageType = "arithmetic",
-    barrier_type: BarrierType = "up-and-out",
-    s0: float | None = None,
 ) -> np.ndarray:
     if average_type == "arithmetic":
         avg = paths.mean(axis=1)
@@ -150,47 +150,17 @@ def asian_barrier_payoff(
         raise ValueError("average_type must be 'arithmetic' or 'geometric'.")
 
     if option_type == "call":
-        vanilla = np.maximum(avg - strike, 0.0)
-    else:
-        vanilla = np.maximum(strike - avg, 0.0)
-
-    if s0 is not None:
-        s0_col = np.full((paths.shape[0], 1), s0)
-        monitored = np.concatenate([s0_col, paths], axis=1)
-    else:
-        monitored = paths
-
-    path_max = monitored.max(axis=1)
-    path_min = monitored.min(axis=1)
-
-    if barrier_type == "up-and-out":
-        active = path_max < barrier
-    elif barrier_type == "down-and-out":
-        active = path_min > barrier
-    elif barrier_type == "up-and-in":
-        active = path_max >= barrier
-    elif barrier_type == "down-and-in":
-        active = path_min <= barrier
-    else:
-        raise ValueError(
-            "barrier_type must be 'up-and-out', 'down-and-out', 'up-and-in', or 'down-and-in'."
-        )
-
-    return vanilla * active.astype(float)
+        return np.maximum(avg - strike, 0.0)
+    return np.maximum(strike - avg, 0.0)
 
 
-def mc_asian_barrier_price(
+def discounted_payoffs_from_normals(
+    z: np.ndarray,
     market: MarketParams,
-    option: AsianBarrierOptionSpec,
-    n_paths: int = 100_000,
-    seed: int = 42,
+    option: AsianOptionSpec,
     use_pca: bool = False,
     n_components: int | None = None,
-) -> tuple[float, float]:
-    rng = np.random.default_rng(seed)
-    d = option.n_fixings if not use_pca else (n_components or option.n_fixings)
-    z = rng.standard_normal(size=(n_paths, d))
-
+) -> np.ndarray:
     paths = simulate_gbm_paths_from_normals(
         z=z,
         s0=market.s0,
@@ -201,16 +171,29 @@ def mc_asian_barrier_price(
         use_pca=use_pca,
         n_components=n_components,
     )
-    payoffs = asian_barrier_payoff(
-        paths=paths,
-        strike=option.strike,
-        barrier=option.barrier,
-        option_type=option.option_type,
-        average_type=option.average_type,
-        barrier_type=option.barrier_type,
-        s0=market.s0,
+    payoffs = asian_payoff(paths, option.strike, option.option_type, option.average_type)
+    return np.exp(-market.r * market.t) * payoffs
+
+
+def mc_asian_price(
+    market: MarketParams,
+    option: AsianOptionSpec,
+    n_paths: int = 100_000,
+    seed: int = 42,
+    use_pca: bool = False,
+    n_components: int | None = None,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    d = option.n_fixings if not use_pca else (n_components or option.n_fixings)
+    z = rng.standard_normal(size=(n_paths, d))
+
+    discounted = discounted_payoffs_from_normals(
+        z=z,
+        market=market,
+        option=option,
+        use_pca=use_pca,
+        n_components=n_components,
     )
-    discounted = np.exp(-market.r * market.t) * payoffs
     price = float(discounted.mean())
     stderr = float(discounted.std(ddof=1) / np.sqrt(n_paths))
     return price, stderr
@@ -231,9 +214,9 @@ def sobol_normal_draws(
     return norm.ppf(u)
 
 
-def qmc_asian_barrier_price_sobol(
+def qmc_asian_price_sobol(
     market: MarketParams,
-    option: AsianBarrierOptionSpec,
+    option: AsianOptionSpec,
     n_paths: int = 131_072,
     use_pca: bool = True,
     n_components: int | None = None,
@@ -243,46 +226,62 @@ def qmc_asian_barrier_price_sobol(
     d = option.n_fixings if not use_pca else (n_components or option.n_fixings)
     z = sobol_normal_draws(n_paths=n_paths, dim=d, scramble=scramble, seed=seed)
 
-    paths = simulate_gbm_paths_from_normals(
+    discounted = discounted_payoffs_from_normals(
         z=z,
-        s0=market.s0,
-        r=market.r,
-        sigma=market.sigma,
-        t=market.t,
-        n_fixings=option.n_fixings,
+        market=market,
+        option=option,
         use_pca=use_pca,
         n_components=n_components,
     )
-    payoffs = asian_barrier_payoff(
-        paths=paths,
-        strike=option.strike,
-        barrier=option.barrier,
-        option_type=option.option_type,
-        average_type=option.average_type,
-        barrier_type=option.barrier_type,
-        s0=market.s0,
-    )
-    discounted = np.exp(-market.r * market.t) * payoffs
     price = float(discounted.mean())
     stderr = float(discounted.std(ddof=1) / np.sqrt(n_paths))
     return price, stderr
 
 
-def demo() -> str:
-    market = MarketParams(
-        s0=100.0,
-        r=0.03,
-        sigma=0.20,
-        t=1.0,
-    )
+def rqmc_asian_price_sobol(
+    market: MarketParams,
+    option: AsianOptionSpec,
+    n_paths: int = 8192,
+    n_replications: int = 16,
+    use_pca: bool = True,
+    n_components: int | None = None,
+    base_seed: int = 42,
+) -> tuple[float, float, np.ndarray]:
+    """
+    Randomized QMC estimator using independent scrambled Sobol replications.
 
-    option = AsianBarrierOptionSpec(
+    """
+    d = option.n_fixings if not use_pca else (n_components or option.n_fixings)
+    estimates = np.empty(n_replications, dtype=float)
+
+    for rep in range(n_replications):
+        z = sobol_normal_draws(
+            n_paths=n_paths,
+            dim=d,
+            scramble=True,
+            seed=base_seed + rep,
+        )
+        discounted = discounted_payoffs_from_normals(
+            z=z,
+            market=market,
+            option=option,
+            use_pca=use_pca,
+            n_components=n_components,
+        )
+        estimates[rep] = discounted.mean()
+
+    mean_estimate = float(estimates.mean())
+    stderr = float(estimates.std(ddof=1) / np.sqrt(n_replications))
+    return mean_estimate, stderr, estimates
+
+
+def demo() -> str:
+    market = MarketParams(s0=100.0, r=0.03, sigma=0.20, t=1.0)
+    option = AsianOptionSpec(
         strike=100.0,
-        barrier=120.0,
         n_fixings=52,
         option_type="call",
         average_type="arithmetic",
-        barrier_type="up-and-out",
     )
 
     european_call = black_scholes_european_price(
@@ -291,14 +290,16 @@ def demo() -> str:
     geometric_asian = geometric_asian_price_bs(
         market.s0, option.strike, market.r, market.sigma, market.t, option.n_fixings, "call"
     )
-    mc_price, mc_stderr = mc_asian_barrier_price(
+
+    mc_price, mc_stderr = mc_asian_price(
         market=market,
         option=option,
         n_paths=100_000,
         seed=42,
         use_pca=False,
     )
-    qmc_price_full, qmc_stderr_full = qmc_asian_barrier_price_sobol(
+
+    qmc_price_full, qmc_stderr_full = qmc_asian_price_sobol(
         market=market,
         option=option,
         n_paths=131_072,
@@ -307,7 +308,8 @@ def demo() -> str:
         scramble=True,
         seed=42,
     )
-    qmc_price_trunc, qmc_stderr_trunc = qmc_asian_barrier_price_sobol(
+
+    qmc_price_trunc, qmc_stderr_trunc = qmc_asian_price_sobol(
         market=market,
         option=option,
         n_paths=131_072,
@@ -317,26 +319,41 @@ def demo() -> str:
         seed=42,
     )
 
+    rqmc_price, rqmc_stderr, rqmc_estimates = rqmc_asian_price_sobol(
+        market=market,
+        option=option,
+        n_paths=8192,
+        n_replications=16,
+        use_pca=True,
+        n_components=8,
+        base_seed=42,
+    )
+
     lines = [
         "=" * 50,
-        "ASIAN BARRIER OPTION SIMULATOR",
+        "ASIAN OPTION SIMULATOR",
         "=" * 50,
         f"Spot S0        : {market.s0:.4f}",
         f"Strike K       : {option.strike:.4f}",
-        f"Barrier B      : {option.barrier:.4f}",
         f"Rate r         : {market.r:.4%}",
         f"Vol sigma      : {market.sigma:.4%}",
         f"Maturity T     : {market.t:.4f}",
         f"Fixings        : {option.n_fixings}",
         f"Option Type    : {option.option_type}",
         f"Average Type   : {option.average_type}",
-        f"Barrier Type   : {option.barrier_type}",
         "",
         f"European Black-Scholes call benchmark          : {european_call:10.6f}",
         f"Geometric Asian closed-form benchmark          : {geometric_asian:10.6f}",
-        f"Asian barrier MC price                         : {mc_price:10.6f}  (SE {mc_stderr:.6f})",
-        f"Asian barrier Sobol-QMC + full PCA             : {qmc_price_full:10.6f}  (SE {qmc_stderr_full:.6f})",
-        f"Asian barrier Sobol-QMC + truncated PCA(8)     : {qmc_price_trunc:10.6f}  (SE {qmc_stderr_trunc:.6f})",
+        f"Arithmetic Asian MC price                      : {mc_price:10.6f}  (SE {mc_stderr:.6f})",
+        f"Arithmetic Asian Sobol-QMC + full PCA          : {qmc_price_full:10.6f}  (pseudo-SE {qmc_stderr_full:.6f})",
+        f"Arithmetic Asian Sobol-QMC + truncated PCA(8)  : {qmc_price_trunc:10.6f}  (pseudo-SE {qmc_stderr_trunc:.6f})",
+        f"Arithmetic Asian RQMC + truncated PCA(8)       : {rqmc_price:10.6f}  (SE {rqmc_stderr:.6f})",
+        "",
+        "Notes:",
+        "- European BS price is not a benchmark for the Asian barrier option value.",
+        "- Geometric Asian closed-form can serve as a useful validation benchmark.",
+        "- The single-run QMC 'SE' is only a rough pseudo-error measure.",
+        "- The RQMC standard error is computed across independent scrambled Sobol replications.",
     ]
     return "\n".join(lines)
 
